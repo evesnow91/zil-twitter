@@ -43,6 +43,8 @@ let make_error_event =
     in
     { _eventname : "Error"; code : result_code }
 
+let tt = True
+
 (***************************************************)
 (*             The contract definition             *)
 (***************************************************)
@@ -55,22 +57,20 @@ contract SocialPay
     blocks_per_day : Uint32
 )
 
-field verified_tweets: Map String ByStr20
-    = Emp String ByStr20
-
-field last_withdrawal: Map ByStr20 BNum
-    = Emp ByStr20 BNum
+field verified_tweets: Map String ByStr20 = Emp String ByStr20
+field last_withdrawal: Map ByStr20 BNum = Emp ByStr20 BNum
+field admins: Map ByStr20 Bool = Emp ByStr20 Bool
 
 (* Emit Errors *)
-procedure IssueErrorEvent(err : Error)
+procedure IssueErrorEvent(err: Error)
   e = make_error_event err;
   event e
 end
 
 (* Only owner can deposit ZIL *)
 transition Deposit()
-    sender_is_owner = builtin eq owner _sender;
-    match sender_is_owner with
+    is_owner = builtin eq owner _sender;
+    match is_owner with
     | False =>
         err = CodeNotAuthorized;
         IssueErrorEvent err
@@ -81,7 +81,28 @@ transition Deposit()
     end
 end
 
-(* Only owner can call this transition                                          *)
+transition ConfigureAdmin(admin_address: ByStr20)
+    is_owner = builtin eq owner _sender;
+    match is_owner with
+    | False =>
+        err = CodeNotAuthorized;
+        IssueErrorEvent err
+    | True =>
+        is_admin <- exists admins[admin_address];
+        match is_admin with
+        | True =>
+            delete admins[admin_address];
+            e = {_eventname : "DeletedAdmin"; admin_address: admin_address};
+            event e
+        | False =>
+            admins[admin_address] := tt;
+            e = {_eventname : "AddedAdmin"; admin_address: admin_address};
+            event e
+        end
+    end
+end
+
+(* Only admins can call this transition                                         *)
 (* The following conditions are checked for (in that order):                    *)
 (*   1. Owner initiates the transition.                                         *)
 (*   2. The tweeter is already registered in the app his/her wallet             *)
@@ -95,9 +116,9 @@ transition VerifyTweet (
     tweet_text: String,
     start_pos: Uint32)
 
-    is_owner = builtin eq _sender owner;
+    is_admin <- exists admins[_sender];
 
-    match is_owner with
+    match is_admin with
     | False =>
         err = CodeNotAuthorized;
         IssueErrorEvent err
