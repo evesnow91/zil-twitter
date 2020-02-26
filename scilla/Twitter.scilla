@@ -27,6 +27,8 @@ let is_valid_substring =
 (* Error events *)
 type Error =
   | CodeNotAuthorized
+  | CodeRegisteredWithinWeek
+  | CodeUserNotRegistered
   | CodeTweetAlreadyExists
   | CodeTweetNotValid
   | CodeTweetWithinDay
@@ -35,10 +37,12 @@ let make_error_event =
   fun (result : Error) =>
     let result_code = 
       match result with
-      | CodeNotAuthorized      => Int32 -1
-      | CodeTweetAlreadyExists => Int32 -2
-      | CodeTweetNotValid      => Int32 -3
-      | CodeTweetWithinDay     => Int32 -4
+      | CodeNotAuthorized        => Int32 -1
+      | CodeRegisteredWithinWeek => Int32 -2
+      | CodeUserNotRegistered    => Int32 -3
+      | CodeTweetAlreadyExists   => Int32 -4
+      | CodeTweetNotValid        => Int32 -5
+      | CodeTweetWithinDay       => Int32 -6
       end
     in
     { _eventname : "Error"; code : result_code }
@@ -54,12 +58,14 @@ contract SocialPay
     owner: ByStr20,
     hashtag: String,
     zils_per_tweet : Uint128,
-    blocks_per_day : Uint32
+    blocks_per_day : Uint32,
+    blocks_per_week : Uint32
 )
 
 field verified_tweets: Map String ByStr20 = Emp String ByStr20
 field last_withdrawal: Map ByStr20 BNum = Emp ByStr20 BNum
 field admins: Map ByStr20 Bool = Emp ByStr20 Bool
+field registered_users: Map String ByStr20 = Emp String ByStr20
 
 (* Emit Errors *)
 procedure IssueErrorEvent(err: Error)
@@ -102,6 +108,43 @@ transition ConfigureAdmin(admin_address: ByStr20)
     end
 end
 
+transition ConfigureUsers(twitter_id: String, recipient_address: ByStr20)
+    is_admin <- exists admins[_sender];
+    match is_admin with
+    | False =>
+        err = CodeNotAuthorized;
+        IssueErrorEvent err
+    | True =>
+        is_registered <- exists registered_users[twitter_id];
+        match is_registered with
+        | True =>
+            current_block <- & BLOCKNUMBER;
+            withdrawal <- last_withdrawal[recipient_address];
+            not_next_week_yet =
+                match withdrawal with
+                | Some last_withdraw_block =>
+                    let next_week_block = builtin badd last_withdraw_block blocks_per_week in
+                    builtin blt current_block next_week_block
+                | None =>
+                    False
+                end;
+            match not_next_week_yet with
+            | True =>
+                err = CodeRegisteredWithinWeek;
+                IssueErrorEvent err
+            | False =>
+                registered_users[twitter_id] := recipient_address;
+                e = {_eventname : "ConfiguredUserAddress"; twitter_id: twitter_id; recipient_address: recipient_address};
+                event e
+            end
+        | False =>
+            registered_users[twitter_id] := recipient_address;
+            e = {_eventname : "ConfiguredUserAddress"; twitter_id: twitter_id; recipient_address: recipient_address};
+            event e
+        end
+    end
+end
+
 (* Only admins can call this transition                                         *)
 (* The following conditions are checked for (in that order):                    *)
 (*   1. Owner initiates the transition.                                         *)
@@ -111,7 +154,7 @@ end
 (*   5. The substring matches the preset hashtag.                               *)
 (*   6. Sufficient time (blocks) have passed since the user was awarded before. *)
 transition VerifyTweet (
-    recipient_address: ByStr20,
+    twitter_id: String,
     tweet_id: String, 
     tweet_text: String,
     start_pos: Uint32)
@@ -123,61 +166,68 @@ transition VerifyTweet (
         err = CodeNotAuthorized;
         IssueErrorEvent err
     | True =>
-        already_verified <- exists verified_tweets[tweet_id];
-        not_already_verified = negb already_verified;
-        hashtag_len = builtin strlen hashtag;
-        valid_substring = is_valid_substring tweet_text start_pos hashtag_len;
-        is_valid = andb valid_substring not_already_verified;
-        match is_valid with
-        | False =>
-            match already_verified with
-            | True =>
-                err = CodeTweetAlreadyExists;
-                IssueErrorEvent err
+        get_recipient_address <- registered_users[twitter_id];
+        match get_recipient_address with
+        | None =>
+            err = CodeUserNotRegistered;
+            IssueErrorEvent err
+        | Some recipient_address =>
+            already_verified <- exists verified_tweets[tweet_id];
+            not_already_verified = negb already_verified;
+            hashtag_len = builtin strlen hashtag;
+            valid_substring = is_valid_substring tweet_text start_pos hashtag_len;
+            is_valid = andb valid_substring not_already_verified;
+            match is_valid with
             | False =>
-                err = CodeTweetNotValid;
-                IssueErrorEvent err
-            end
-        | True =>
-            match_hashtag = builtin substr tweet_text start_pos hashtag_len;
-            is_hashtag = builtin eq match_hashtag hashtag;
-            match is_hashtag with
-            | False =>
-                err = CodeTweetNotValid;
-                IssueErrorEvent err
-            | True =>
-                withdrawal <- last_withdrawal[recipient_address];
-                current_block <- & BLOCKNUMBER;
-                not_next_day_yet =
-                    match withdrawal with
-                    | Some last_withdraw_block =>
-                        let next_day_block = builtin badd last_withdraw_block blocks_per_day in
-                        builtin blt current_block next_day_block
-                    | None =>
-                        False
-                    end;
-                match not_next_day_yet with
+                match already_verified with
                 | True =>
-                    err = CodeTweetWithinDay;
+                    err = CodeTweetAlreadyExists;
                     IssueErrorEvent err
                 | False =>
-                    verified_tweets[tweet_id] := recipient_address;
-                    last_withdrawal[recipient_address] := current_block;
-                    e = {
-                            _eventname : "VerifyTweetSuccessful";
-                            sender: _sender;
-                            recipient: recipient_address;
-                            reward_amount: zils_per_tweet;
-                            tweet_id: tweet_id
-                        };
-                    event e;
-                    msg = { 
-                            _tag: "";
-                            _recipient: recipient_address;
-                            _amount: zils_per_tweet 
-                        };
-                    msgs = one_msg msg;
-                    send msgs
+                    err = CodeTweetNotValid;
+                    IssueErrorEvent err
+                end
+            | True =>
+                match_hashtag = builtin substr tweet_text start_pos hashtag_len;
+                is_hashtag = builtin eq match_hashtag hashtag;
+                match is_hashtag with
+                | False =>
+                    err = CodeTweetNotValid;
+                    IssueErrorEvent err
+                | True =>
+                    withdrawal <- last_withdrawal[recipient_address];
+                    current_block <- & BLOCKNUMBER;
+                    not_next_day_yet =
+                        match withdrawal with
+                        | Some last_withdraw_block =>
+                            let next_day_block = builtin badd last_withdraw_block blocks_per_day in
+                            builtin blt current_block next_day_block
+                        | None =>
+                            False
+                        end;
+                    match not_next_day_yet with
+                    | True =>
+                        err = CodeTweetWithinDay;
+                        IssueErrorEvent err
+                    | False =>
+                        verified_tweets[tweet_id] := recipient_address;
+                        last_withdrawal[recipient_address] := current_block;
+                        e = {
+                                _eventname : "VerifyTweetSuccessful";
+                                sender: _sender;
+                                recipient: recipient_address;
+                                reward_amount: zils_per_tweet;
+                                tweet_id: tweet_id
+                            };
+                        event e;
+                        msg = { 
+                                _tag: "";
+                                _recipient: recipient_address;
+                                _amount: zils_per_tweet 
+                            };
+                        msgs = one_msg msg;
+                        send msgs
+                    end
                 end
             end
         end
